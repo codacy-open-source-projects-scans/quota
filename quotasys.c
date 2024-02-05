@@ -25,6 +25,7 @@
 #include <sys/vfs.h>
 #include <stdint.h>
 #include <sys/utsname.h>
+#include <sys/syscall.h>
 
 #include "pot.h"
 #include "bylabel.h"
@@ -69,7 +70,15 @@ int nfs_fstype(char *type)
  */
 int meta_qf_fstype(char *type)
 {
-	return !strcmp(type, MNTTYPE_OCFS2);
+	return !strcmp(type, MNTTYPE_OCFS2) || !strcmp(type, MNTTYPE_TMPFS);
+}
+
+/*
+ *	Check whether the filesystem is not using block device as a backing
+ */
+int nodev_fstype(char *type)
+{
+	return !strcmp(type, MNTTYPE_TMPFS) || nfs_fstype(type);
 }
 
 /*
@@ -671,6 +680,36 @@ const char *str2number(const char *string, qsize_t *inodes)
 }
 
 /*
+ * Wrappers for quotactl syscalls
+ */
+#ifdef SYS_quotactl_fd
+int do_quotactl(int cmd, const char *dev, const char *mnt, int id, caddr_t addr)
+{
+	int ret = -EINVAL;
+
+	if (mnt && !dev) {
+		int fd = open(mnt, O_DIRECTORY | O_PATH);
+
+		if (fd < 0) {
+			errstr(_("Unable to get a filedescriptor from mountpoint: %s\n"), mnt);
+			return fd;
+		}
+
+		ret = syscall(SYS_quotactl_fd, fd, cmd, id, addr);
+		close(fd);
+		return ret;
+	}
+
+	return quotactl(cmd, dev, id, addr);
+}
+#else
+int do_quotactl(int cmd, const char *dev, const char *mnt, int id, caddr_t addr)
+{
+	return quotactl(cmd, dev, id, addr);
+}
+#endif
+
+/*
  *	Wrappers for mount options processing functions
  */
 
@@ -685,7 +724,7 @@ static int hasxfsquota(const char *dev, struct mntent *mnt, int type, int flags)
 		return QF_XFS;
 
 	memset(&info, 0, sizeof(struct xfs_mem_dqinfo));
-	if (!quotactl(QCMD(Q_XFS_GETQSTAT, type), dev, 0, (void *)&info)) {
+	if (!do_quotactl(QCMD(Q_XFS_GETQSTAT, type), dev, mnt->mnt_dir, 0, (void *)&info)) {
 #ifdef XFS_ROOTHACK
 		int sbflags = (info.qs_flags & 0xff00) >> 8;
 #endif /* XFS_ROOTHACK */
@@ -719,8 +758,9 @@ static int hasvfsmetaquota(const char *dev, struct mntent *mnt, int type, int fl
 {
 	uint32_t fmt;
 
-	if (!quotactl(QCMD(Q_GETFMT, type), dev, 0, (void *)&fmt))
+	if (!do_quotactl(QCMD(Q_GETFMT, type), dev, mnt->mnt_dir, 0, (void *)&fmt))
 		return QF_META;
+
 	return QF_ERROR;
 }
 
@@ -785,8 +825,13 @@ static int hasquota(const char *dev, struct mntent *mnt, int type, int flags)
 	    !strcmp(mnt->mnt_type, MNTTYPE_XFS) ||
 	    !strcmp(mnt->mnt_type, MNTTYPE_EXFS))
 		return hasxfsquota(dev, mnt, type, flags);
+
 	if (!strcmp(mnt->mnt_type, MNTTYPE_OCFS2))
 		return hasvfsmetaquota(dev, mnt, type, flags);
+
+	/* tmpfs has no device, pass null here so quotactl_fd() is called */
+	if (!strcmp(mnt->mnt_type, MNTTYPE_TMPFS))
+		return hasvfsmetaquota(NULL, mnt, type, flags);
 	/*
 	 * For ext4 we check whether it has quota in system files and if not,
 	 * we fall back on checking standard quotas. Furthermore we cannot use
@@ -796,7 +841,7 @@ static int hasquota(const char *dev, struct mntent *mnt, int type, int flags)
 	if (!strcmp(mnt->mnt_type, MNTTYPE_EXT4) || !strcmp(mnt->mnt_type, MNTTYPE_F2FS)) {
 		struct if_dqinfo kinfo;
 
-		if (quotactl(QCMD(Q_GETINFO, type), dev, 0, (void *)&kinfo) == 0) {
+		if (do_quotactl(QCMD(Q_GETINFO, type), dev, mnt->mnt_dir, 0, (void *)&kinfo) == 0) {
 			if (kinfo.dqi_flags & DQF_SYS_FILE)
 				return QF_META;
 		}
@@ -1069,11 +1114,11 @@ void init_kernel_interface(void)
 		else {
 			fs_quota_stat_t dummy;
 
-			if (!quotactl(QCMD(Q_XGETQSTAT, 0), "/dev/root", 0, (void *)&dummy) ||
+			if (!do_quotactl(QCMD(Q_XGETQSTAT, 0), "/dev/root", NULL, 0, (void *)&dummy) ||
 			    (errno != EINVAL && errno != ENOSYS))
 				kernel_qfmt[kernel_qfmt_num++] = QF_XFS;
 		}
-		if (quotactl(QCMD(Q_V2_GETSTATS, 0), NULL, 0, (void *)&v2_stats) >= 0) {
+		if (do_quotactl(QCMD(Q_V2_GETSTATS, 0), NULL, NULL, 0, (void *)&v2_stats) >= 0) {
 			kernel_qfmt[kernel_qfmt_num++] = QF_VFSV0;
 			kernel_iface = IFACE_VFSV0;
 		}
@@ -1085,9 +1130,9 @@ void init_kernel_interface(void)
 			int err_quota = 0;
  			char tmp[1024];         /* Just temporary buffer */
 
-			if (quotactl(QCMD(Q_V1_GETSTATS, 0), NULL, 0, tmp))
+			if (do_quotactl(QCMD(Q_V1_GETSTATS, 0), NULL, NULL, 0, tmp))
 				err_stat = errno;
-			if (quotactl(QCMD(Q_V1_GETQUOTA, 0), "/dev/null", 0, tmp))
+			if (do_quotactl(QCMD(Q_V1_GETQUOTA, 0), "/dev/null", NULL, 0, tmp))
 				err_quota = errno;
 
 			/* On a RedHat 2.4.2-2 	we expect 0, EINVAL
@@ -1127,7 +1172,7 @@ static int v1_kern_quota_on(const char *dev, int type)
 	char tmp[1024];		/* Just temporary buffer */
 	qid_t id = (type == USRQUOTA) ? getuid() : getgid();
 
-	if (!quotactl(QCMD(Q_V1_GETQUOTA, type), dev, id, tmp))	/* OK? */
+	if (!do_quotactl(QCMD(Q_V1_GETQUOTA, type), dev, NULL, id, tmp))	/* OK? */
 		return 1;
 	return 0;
 }
@@ -1138,7 +1183,7 @@ static int v2_kern_quota_on(const char *dev, int type)
 	char tmp[1024];		/* Just temporary buffer */
 	qid_t id = (type == USRQUOTA) ? getuid() : getgid();
 
-	if (!quotactl(QCMD(Q_V2_GETQUOTA, type), dev, id, tmp))	/* OK? */
+	if (!do_quotactl(QCMD(Q_V2_GETQUOTA, type), dev, NULL, id, tmp))	/* OK? */
 		return 1;
 	return 0;
 }
@@ -1155,7 +1200,7 @@ int kern_quota_state_xfs(const char *dev, int type)
 {
 	struct xfs_mem_dqinfo info;
 
-	if (!quotactl(QCMD(Q_XFS_GETQSTAT, type), dev, 0, (void *)&info)) {
+	if (!do_quotactl(QCMD(Q_XFS_GETQSTAT, type), dev, NULL, 0, (void *)&info)) {
 		if (type == USRQUOTA) {
 			return !!(info.qs_flags & XFS_QUOTA_UDQ_ACCT) +
 			       !!(info.qs_flags & XFS_QUOTA_UDQ_ENFD);
@@ -1199,8 +1244,8 @@ int kern_quota_on(struct mount_entry *mnt, int type, int fmt)
 	if (kernel_iface == IFACE_GENERIC) {
 		int actfmt;
 
-		if (quotactl(QCMD(Q_GETFMT, type), mnt->me_devname, 0,
-			     (void *)&actfmt) >= 0) {
+		if (do_quotactl(QCMD(Q_GETFMT, type), mnt->me_devname,
+				mnt->me_dir, 0, (void *)&actfmt) >= 0) {
 			actfmt = kern2utilfmt(actfmt);
 			if (actfmt >= 0)
 				return actfmt;
@@ -1223,7 +1268,7 @@ int kern_quota_on(struct mount_entry *mnt, int type, int fmt)
  */
 
 struct searched_dir {
-	int sd_dir;		/* Is searched dir mountpoint or in fact device? */
+	int sd_isdir;		/* Is searched dir mountpoint or in fact device? */
 	dev_t sd_dev;		/* Device mountpoint lies on */
 	ino_t sd_ino;		/* Inode number of mountpoint */
 	const char *sd_name;	/* Name of given dir/device */
@@ -1353,7 +1398,7 @@ alloc:
 			continue;
 		}
 
-		if (!nfs_fstype(mnt->mnt_type)) {
+		if (!nodev_fstype(mnt->mnt_type)) {
 			if (stat(devname, &st) < 0) {	/* Can't stat mounted device? */
 				errstr(_("Cannot stat() mounted device %s: %s\n"), devname, strerror(errno));
 				free((char *)devname);
@@ -1367,15 +1412,16 @@ alloc:
 			dev = st.st_rdev;
 			for (i = 0; i < mnt_entries_cnt && mnt_entries[i].me_dev != dev; i++);
 		}
-		/* Cope with network filesystems or new mountpoint */
-		if (nfs_fstype(mnt->mnt_type) || i == mnt_entries_cnt) {
+
+		/* Cope with filesystems without a block device or new mountpoint */
+		if (nodev_fstype(mnt->mnt_type) || i == mnt_entries_cnt) {
 			if (stat(mnt->mnt_dir, &st) < 0) {	/* Can't stat mountpoint? We have better ignore it... */
 				errstr(_("Cannot stat() mountpoint %s: %s\n"), mnt->mnt_dir, strerror(errno));
 				free((char *)devname);
 				continue;
 			}
-			if (nfs_fstype(mnt->mnt_type)) {
-				/* For network filesystems we must get device from root */
+			if (nodev_fstype(mnt->mnt_type)) {
+				/* For filesystems without block device we must get device from root */
 				dev = st.st_dev;
 				if (!(flags & MS_NFS_ALL)) {
 					for (i = 0; i < mnt_entries_cnt && mnt_entries[i].me_dev != dev; i++);
@@ -1454,7 +1500,7 @@ static int process_dirs(int dcnt, char **dirs, int flags)
 					errstr(_("Cannot stat() given mountpoint %s: %s\nSkipping...\n"), dirs[i], strerror(errno));
 					continue;
 				}
-			check_dirs[check_dirs_cnt].sd_dir = S_ISDIR(st.st_mode);
+			check_dirs[check_dirs_cnt].sd_isdir = S_ISDIR(st.st_mode);
 			if (S_ISDIR(st.st_mode)) {
 				const char *realmnt = dirs[i];
 
@@ -1538,7 +1584,7 @@ restart:
 		return 0;
 	sd = check_dirs + act_checked;
 	for (i = 0; i < mnt_entries_cnt; i++) {
-		if (sd->sd_dir) {
+		if (sd->sd_isdir) {
 			if (sd->sd_dev == mnt_entries[i].me_dev && sd->sd_ino == mnt_entries[i].me_ino)
 				break;
 		}
