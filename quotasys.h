@@ -24,16 +24,8 @@
 #define IOI_INITSCAN	0x2	/* Prepare handle for scanning dquots */
 #define IOI_NFS_MIXED_PATHS	0x4	/* Trim leading / from NFSv4 mountpoints */
 
-/* Interface versions */
-#define IFACE_VFSOLD 1
-#define IFACE_VFSV0 2
-#define IFACE_GENERIC 3
-
 /* Path to export table of NFS daemon */
 #define NFSD_XTAB_PATH "/var/lib/nfs/etab"
-
-/* Supported kernel interface */
-extern int kernel_iface;
 
 struct mount_entry {
 	char *me_type;		/* Type of filesystem for given entry */
@@ -139,7 +131,7 @@ void init_kernel_interface(void);
  * Check whether is quota turned on on given device for given type. This
  * works for XFS for all kernels and for other filesystems since kernel 4.1.
  */
-int kern_quota_state_xfs(const char *dev, int type);
+int kern_quota_state_xfs(struct mount_entry *mnt, int type);
 
 /* Check whether is quota turned on on given device for given type */
 int kern_quota_on(struct mount_entry *mnt, int type, int fmt);
@@ -169,6 +161,9 @@ int ext4_supports_quota_feature(void);
 
 /* Wrapper around quota syscalls, either call quotactl or quotactl_fd */
 int do_quotactl(int cmd, const char *dev, const char *mnt, int id, caddr_t addr);
+
+/* Helper to perform quotactl for a mount entry */
+int quotactl_mnt(int cmd, int type, struct mount_entry *mnt, int id, caddr_t addr);
 
 /* Quota output formats */
 #define QOF_ERROR	-1

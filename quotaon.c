@@ -142,33 +142,23 @@ int pinfo(char *fmt, ...)
 /*
  *	Enable/disable rsquash on given filesystem
  */
-static int quotarsquashonoff(const char *quotadev, int type, int flags)
+static int quotarsquashonoff(struct mount_entry *mnt, int type, int flags)
 {
 #if defined(MNTOPT_RSQUASH)
 	int ret;
+	struct if_dqinfo info;
 
-	if (kernel_iface == IFACE_GENERIC) {
-		int qcmd = QCMD(Q_SETINFO, type);
-		struct if_dqinfo info;
-
-		info.dqi_flags = V1_DQF_RSQUASH;
-		info.dqi_valid = IIF_FLAGS;
-		ret = do_quotactl(qcmd, quotadev, NULL, 0, (void *)&info);
-	}
-	else {
-		int mode = (flags & STATEFLAG_OFF) ? 0 : 1;
-		int qcmd = QCMD(Q_V1_RSQUASH, type);
-
-		ret = do_quotactl(qcmd, quotadev, NULL, 0, (void *)&mode);
-	}
+	info.dqi_flags = V1_DQF_RSQUASH;
+	info.dqi_valid = IIF_FLAGS;
+	ret = quotactl_mnt(Q_SETINFO, type, mnt, 0, (void *)&info);
 	if (ret < 0) {
-		errstr(_("set root_squash on %s: %s\n"), quotadev, strerror(errno));
+		errstr(_("set root_squash on %s: %s\n"), mnt->me_devname, strerror(errno));
 		return 1;
 	}
 	if (flags & STATEFLAG_OFF)
-		pinfo(_("%s: %s root_squash turned off\n"), quotadev, type2name(type));
+		pinfo(_("%s: %s root_squash turned off\n"), mnt->me_devname, type2name(type));
 	else if (flags & STATEFLAG_ON)
-		pinfo(_("%s: %s root_squash turned on\n"), quotadev, type2name(type));
+		pinfo(_("%s: %s root_squash turned on\n"), mnt->me_devname, type2name(type));
 #endif
 	return 0;
 }
@@ -176,42 +166,29 @@ static int quotarsquashonoff(const char *quotadev, int type, int flags)
 /*
  *	Enable/disable VFS quota on given filesystem
  */
-static int quotaonoff(const char *quotadev, const char *quotadir, char *quotafile, int type, int fmt, int flags)
+static int quotaonoff(struct mount_entry *mnt, char *quotafile, int type,
+		      int fmt, int flags)
 {
-	int qcmd, kqf;
-
 	if (flags & STATEFLAG_OFF) {
-		if (kernel_iface == IFACE_GENERIC)
-			qcmd = QCMD(Q_QUOTAOFF, type);
-		else
-			qcmd = QCMD(Q_6_5_QUOTAOFF, type);
-		if (do_quotactl(qcmd, quotadev, quotadir, 0, NULL) < 0) {
-			errstr(_("quotactl on %s [%s]: %s\n"), quotadev, quotadir, strerror(errno));
+		if (quotactl_mnt(Q_QUOTAOFF, type, mnt, 0, NULL) < 0) {
+			errstr(_("quotactl on %s [%s]: %s\n"), mnt->me_devname, mnt->me_dir, strerror(errno));
 			return 1;
 		}
-		pinfo(_("%s [%s]: %s quotas turned off\n"), quotadev, quotadir, _(type2name(type)));
+		pinfo(_("%s [%s]: %s quotas turned off\n"), mnt->me_devname, mnt->me_dir, _(type2name(type)));
 		return 0;
 	}
-	if (kernel_iface == IFACE_GENERIC) {
-		qcmd = QCMD(Q_QUOTAON, type);
- 		kqf = util2kernfmt(fmt);
-	}
-	else {
-		qcmd = QCMD(Q_6_5_QUOTAON, type);
-		kqf = 0;
-	}
-	if (do_quotactl(qcmd, quotadev, quotadir, kqf, (void *)quotafile) < 0) {
+	if (quotactl_mnt(Q_QUOTAON, type, mnt, util2kernfmt(fmt), (void *)quotafile) < 0) {
 		if (errno == ENOENT)
-			errstr(_("cannot find %s on %s [%s]\n"), quotafile, quotadev, quotadir);
+			errstr(_("cannot find %s on %s [%s]\n"), quotafile, mnt->me_devname, mnt->me_dir);
 		else
-			errstr(_("using %s on %s [%s]: %s\n"), quotafile, quotadev, quotadir, strerror(errno));
+			errstr(_("using %s on %s [%s]: %s\n"), quotafile, mnt->me_devname, mnt->me_dir, strerror(errno));
 		if (errno == EINVAL)
 			errstr(_("Maybe create new quota files with quotacheck(8)?\n"));
 		else if (errno == ESRCH)
 			errstr(_("Quota format not supported in kernel.\n"));
 		return 1;
 	}
-	pinfo(_("%s [%s]: %s quotas turned on\n"), quotadev, quotadir, _(type2name(type)));
+	pinfo(_("%s [%s]: %s quotas turned on\n"), mnt->me_devname, mnt->me_dir, _(type2name(type)));
 	return 0;
 }
 
@@ -223,10 +200,10 @@ static int v1_newstate(struct mount_entry *mnt, int type, char *file, int flags,
 	int errs = 0;
 
 	if ((flags & STATEFLAG_OFF) && str_hasmntopt(mnt->me_opts, MNTOPT_RSQUASH))
-		errs += quotarsquashonoff(mnt->me_devname, type, flags);
-	errs += quotaonoff(mnt->me_devname, mnt->me_dir, file, type, QF_VFSOLD, flags);
+		errs += quotarsquashonoff(mnt, type, flags);
+	errs += quotaonoff(mnt, file, type, QF_VFSOLD, flags);
 	if ((flags & STATEFLAG_ON) && str_hasmntopt(mnt->me_opts, MNTOPT_RSQUASH))
-		errs += quotarsquashonoff(mnt->me_devname, type, flags);
+		errs += quotarsquashonoff(mnt, type, flags);
 	return errs;
 }
 
@@ -235,7 +212,7 @@ static int v1_newstate(struct mount_entry *mnt, int type, char *file, int flags,
  */
 static int v2_newstate(struct mount_entry *mnt, int type, char *file, int flags, int fmt)
 {
-	return quotaonoff(mnt->me_devname, mnt->me_dir, file, type, fmt, flags);
+	return quotaonoff(mnt, file, type, fmt, flags);
 }
 
 /*
@@ -318,10 +295,15 @@ static int print_state(struct mount_entry *mnt, int type)
 	int on = 0;
 	char *state;
 
+	/*
+	 * XGETQSTAT provides more information than GETINFO so use it if
+	 * possible
+	 */
 	if (kern_qfmt_supp(QF_XFS)) {
-		on = kern_quota_state_xfs(mnt->me_devname, type);
-		if (!strcmp(mnt->me_type, MNTTYPE_XFS) ||
-		    !strcmp(mnt->me_type, MNTTYPE_GFS2) || on >= 0 ||
+		on = kern_quota_state_xfs(mnt, type);
+		if (on >= 0 ||
+		    !strcmp(mnt->me_type, MNTTYPE_XFS) ||
+		    !strcmp(mnt->me_type, MNTTYPE_GFS2) ||
 		    !strcmp(mnt->me_type, MNTTYPE_EXFS)) {
 			if (on < 0)
 				on = 0;
@@ -336,12 +318,7 @@ static int print_state(struct mount_entry *mnt, int type)
 			goto print;
 		}
 	}
-	if (kernel_iface == IFACE_GENERIC)
-		on = kern_quota_on(mnt, type, -1) != -1;
-	else if (kern_qfmt_supp(QF_VFSV0))
-		on = kern_quota_on(mnt, type, QF_VFSV0) != -1;
-	else if (kern_qfmt_supp(QF_VFSOLD))
-		on = kern_quota_on(mnt, type, QF_VFSOLD) != -1;
+	on = kern_quota_on(mnt, type, -1) != -1;
 
 print_state:
 	state = on ? _("on") : _("off");

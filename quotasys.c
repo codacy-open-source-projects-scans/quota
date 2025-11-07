@@ -457,6 +457,19 @@ int do_quotactl(int cmd, const char *dev, const char *mnt, int id, caddr_t addr)
 }
 #endif
 
+/* Run quotactl for given mount */
+int quotactl_mnt(int cmd, int type, struct mount_entry *mnt, int id, caddr_t addr)
+{
+	const char *dev = mnt->me_devname;
+	const char *dir = mnt->me_dir;
+
+	if (!strcmp(mnt->me_type, MNTTYPE_TMPFS) ||
+	    !strcmp(mnt->me_type, MNTTYPE_BCACHEFS))
+		dev = NULL;
+
+	return do_quotactl(QCMD(cmd, type), dev, dir, id, addr);
+}
+
 /*
  *	Wrappers for mount options processing functions
  */
@@ -827,7 +840,6 @@ int devcmp_handles(struct quota_handle *a, struct quota_handle *b)
  *	Check kernel quota version
  */
 
-int kernel_iface;	/* Kernel interface type */
 static int kernel_qfmt_num;	/* Number of different supported formats */
 static int kernel_qfmt[QUOTAFORMATS]; /* Formats supported by kernel */
 
@@ -855,7 +867,6 @@ void init_kernel_interface(void)
 	kernel_qfmt_num = 0;
 	/* Detect new kernel interface; Assume generic interface unless we can prove there is not one... */
 	if (!stat("/proc/sys/fs/quota", &st) || errno != ENOENT) {
-		kernel_iface = IFACE_GENERIC;
 		kernel_qfmt[kernel_qfmt_num++] = QF_META;
 		kernel_qfmt[kernel_qfmt_num++] = QF_XFS;
 		kernel_qfmt[kernel_qfmt_num++] = QF_VFSOLD;
@@ -863,8 +874,6 @@ void init_kernel_interface(void)
 		kernel_qfmt[kernel_qfmt_num++] = QF_VFSV1;
 	}
 	else {
-		struct v2_dqstats v2_stats;
-
 		if (!stat("/proc/fs/xfs/stat", &st) ||
 		    !stat("/proc/fs/exfs/stat", &st))
 			kernel_qfmt[kernel_qfmt_num++] = QF_XFS;
@@ -874,35 +883,6 @@ void init_kernel_interface(void)
 			if (!do_quotactl(QCMD(Q_XGETQSTAT, 0), "/dev/root", NULL, 0, (void *)&dummy) ||
 			    (errno != EINVAL && errno != ENOSYS))
 				kernel_qfmt[kernel_qfmt_num++] = QF_XFS;
-		}
-		if (do_quotactl(QCMD(Q_V2_GETSTATS, 0), NULL, NULL, 0, (void *)&v2_stats) >= 0) {
-			kernel_qfmt[kernel_qfmt_num++] = QF_VFSV0;
-			kernel_iface = IFACE_VFSV0;
-		}
-		else if (errno != ENOSYS && errno != ENOTSUP) {
-			/* RedHat 7.1 (2.4.2-2) newquota check 
-			 * Q_V2_GETSTATS in it's old place, Q_GETQUOTA in the new place
-			 * (they haven't moved Q_GETSTATS to its new value) */
-			int err_stat = 0;
-			int err_quota = 0;
- 			char tmp[1024];         /* Just temporary buffer */
-
-			if (do_quotactl(QCMD(Q_V1_GETSTATS, 0), NULL, NULL, 0, tmp))
-				err_stat = errno;
-			if (do_quotactl(QCMD(Q_V1_GETQUOTA, 0), "/dev/null", NULL, 0, tmp))
-				err_quota = errno;
-
-			/* On a RedHat 2.4.2-2 	we expect 0, EINVAL
-			 * On a 2.4.x 		we expect 0, ENOENT
-			 * On a 2.4.x-ac	we wont get here */
-			if (err_stat == 0 && err_quota == EINVAL) {
-				kernel_qfmt[kernel_qfmt_num++] = QF_VFSV0;
-				kernel_iface = IFACE_VFSV0;
-			}
-			else {
-				kernel_qfmt[kernel_qfmt_num++] = QF_VFSOLD;
-				kernel_iface = IFACE_VFSOLD;
-			}
 		}
 	}
 	if (sigaction(SIGSEGV, &oldsig, NULL) < 0)
@@ -923,28 +903,6 @@ int kern_qfmt_supp(int fmt)
 	return 0;
 }
 
-/* Check whether old quota is turned on on given device */
-static int v1_kern_quota_on(const char *dev, int type)
-{
-	char tmp[1024];		/* Just temporary buffer */
-	qid_t id = (type == USRQUOTA) ? getuid() : getgid();
-
-	if (!do_quotactl(QCMD(Q_V1_GETQUOTA, type), dev, NULL, id, tmp))	/* OK? */
-		return 1;
-	return 0;
-}
-
-/* Check whether new quota is turned on on given device */
-static int v2_kern_quota_on(const char *dev, int type)
-{
-	char tmp[1024];		/* Just temporary buffer */
-	qid_t id = (type == USRQUOTA) ? getuid() : getgid();
-
-	if (!do_quotactl(QCMD(Q_V2_GETQUOTA, type), dev, NULL, id, tmp))	/* OK? */
-		return 1;
-	return 0;
-}
-
 /*
  * Check whether quota is turned on on given device. This quotactl always
  * worked for XFS and it works even for VFS quotas for kernel 4.1 and newer.
@@ -953,11 +911,11 @@ static int v2_kern_quota_on(const char *dev, int type)
  * on, and 2 when both accounting and enforcement is turned on. We return -1
  * on error.
  */
-int kern_quota_state_xfs(const char *dev, int type)
+int kern_quota_state_xfs(struct mount_entry *mnt, int type)
 {
 	struct xfs_mem_dqinfo info;
 
-	if (!do_quotactl(QCMD(Q_XFS_GETQSTAT, type), dev, NULL, 0, (void *)&info)) {
+	if (!quotactl_mnt(Q_XFS_GETQSTAT, type, mnt, 0, (void *)&info)) {
 		if (type == USRQUOTA) {
 			return !!(info.qs_flags & XFS_QUOTA_UDQ_ACCT) +
 			       !!(info.qs_flags & XFS_QUOTA_UDQ_ENFD);
@@ -980,13 +938,15 @@ int kern_quota_state_xfs(const char *dev, int type)
  */
 int kern_quota_on(struct mount_entry *mnt, int type, int fmt)
 {
+	int actfmt;
+
 	if (mnt->me_qfmt[type] < 0)
 		return -1;
 	if (fmt == QF_RPC)
 		return -1;
 	if (mnt->me_qfmt[type] == QF_XFS) {
 		if ((fmt == -1 || fmt == QF_XFS) &&
-		    kern_quota_state_xfs(mnt->me_devname, type) > 0)
+		    kern_quota_state_xfs(mnt, type) > 0)
 			return QF_XFS;
 		return -1;
 	}
@@ -998,22 +958,10 @@ int kern_quota_on(struct mount_entry *mnt, int type, int fmt)
 		return QF_META;
 
 	/* Check whether quota is turned on... */
-	if (kernel_iface == IFACE_GENERIC) {
-		int actfmt;
-
-		if (do_quotactl(QCMD(Q_GETFMT, type), mnt->me_devname,
-				mnt->me_dir, 0, (void *)&actfmt) >= 0) {
-			actfmt = kern2utilfmt(actfmt);
-			if (actfmt >= 0)
-				return actfmt;
-		}
-	} else {
-		if ((fmt == -1 || fmt == QF_VFSV0) &&
-		    v2_kern_quota_on(mnt->me_devname, type))
-			return QF_VFSV0;
-		if ((fmt == -1 || fmt == QF_VFSOLD) &&
-		    v1_kern_quota_on(mnt->me_devname, type))
-			return QF_VFSOLD;
+	if (quotactl_mnt(Q_GETFMT, type, mnt, 0, (void *)&actfmt) >= 0) {
+		actfmt = kern2utilfmt(actfmt);
+		if (actfmt >= 0)
+			return actfmt;
 	}
 	return -1;
 }
